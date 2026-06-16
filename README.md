@@ -7,7 +7,7 @@ Modèle de **classification** qui estime l'issue d'un match international de foo
 
 > Projet réalisé par **Alexis Zueras — AZ Analytics**.
 
-<!-- Ajoute ici une capture d'écran ou un GIF de l'app : ![Aperçu](docs/demo.png) -->
+<img width="1469" height="845" alt="Capture d’écran 2026-06-16 à 15 25 19" src="https://github.com/user-attachments/assets/f14c274b-51e1-4ab1-bd0c-d5e8c0dd4491" />
 
 ---
 

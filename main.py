@@ -1,121 +1,167 @@
 """
-Interface Streamlit pour le modèle de prédiction de matchs.
+Interface Streamlit pour le modèle de prédiction de matchs internationaux.
 
 Lancement :
-    pip install streamlit
-    streamlit run app.py
+    pip install -r requirements.txt
+    streamlit run main.py
 
-Le fichier prediction_foot.py doit être dans le MÊME dossier (l'app y puise
-ses fonctions). Le CSV doit être accessible via le CHEMIN_CSV défini dans
-prediction_foot.py (par défaut "archive/results.csv").
+prediction_foot.py doit être dans le MÊME dossier (l'app y puise ses fonctions).
 """
-
 import numpy as np
 import pandas as pd
 import streamlit as st
+import plotly.graph_objects as go
 
-# On réutilise tout le travail déjà fait dans prediction_foot.py.
-# Grâce au garde "if __name__ == '__main__'", cet import ne relance PAS
-# l'entraînement : il ne charge que les fonctions et les constantes.
-from prediction_foot import (
-    charger_donnees,
-    calculer_features,
-    entrainer,
-    FEATURES,
-)
+from prediction_foot import charger_donnees, calculer_features, entrainer, FEATURES
 
-st.set_page_config(page_title="Prédiction Foot", page_icon="⚽", layout="centered")
+# ==========================================================================
+# CONFIG + STYLE
+# ==========================================================================
+st.set_page_config(page_title="Oracle des matchs", page_icon="⚽", layout="wide")
+
+VERT = "#21BF73"   # victoire domicile
+GRIS = "#8A93A6"   # nul
+ROUGE = "#E4572E"  # victoire extérieur
+
+st.markdown("""
+<style>
+.block-container {padding-top: 2.2rem; max-width: 1000px;}
+h1, h2, h3 {letter-spacing: .2px;}
+.vs-card {background:#16263B; border-radius:18px; padding:22px 18px; text-align:center;}
+.vs-team {font-size:26px; font-weight:800; color:#FFFFFF;}
+.vs-elo {font-size:14px; color:#9FB3C8; margin-top:2px;}
+.vs-mid {font-size:20px; font-weight:800; color:#21BF73;}
+.fav-box {background:#13351f; border:1px solid #21BF73; border-radius:14px;
+          padding:16px 20px; font-size:18px; color:#EAFBF0;}
+.note {color:#8A93A6; font-size:13px;}
+</style>
+""", unsafe_allow_html=True)
 
 
-# ---------------------------------------------------------------------------
-# Préparation (mise en cache : ne s'exécute qu'une seule fois par session)
-# ---------------------------------------------------------------------------
+# ==========================================================================
+# DONNÉES + MODÈLE (cache : une seule fois par session)
+# ==========================================================================
 @st.cache_resource(show_spinner="Chargement des données et entraînement du modèle…")
 def preparer():
     df = charger_donnees()
     df, elos, hist = calculer_features(df)
     modele = entrainer(df, rapport=False)
-    derniere_date = df["date"].max().date()
-    return modele, elos, hist, derniere_date
+    return modele, elos, hist, df["date"].max().date()
 
 
-def proba_match(modele, elos, hist, dom, ext, terrain_neutre):
-    """Renvoie un dict {classe: probabilité} pour le match demandé."""
-    r_dom, r_ext = elos[dom], elos[ext]
+def proba_match(modele, elos, hist, dom, ext, neutre):
     f_dom = np.mean(hist[dom]) if len(hist[dom]) else 1.0
     f_ext = np.mean(hist[ext]) if len(hist[ext]) else 1.0
-
     X = pd.DataFrame([{
-        "elo_diff": r_dom - r_ext,
-        "form_diff": f_dom - f_ext,
-        "home_elo": r_dom,
-        "away_elo": r_ext,
-        "neutral": terrain_neutre,
+        "elo_diff": elos[dom] - elos[ext], "form_diff": f_dom - f_ext,
+        "home_elo": elos[dom], "away_elo": elos[ext], "neutral": neutre,
     }])[FEATURES]
-
     proba = modele.predict_proba(X)[0]
-    return dict(zip(modele.classes_, proba))
+    return dict(zip(modele.classes_, proba)), f_dom, f_ext
 
 
-# ---------------------------------------------------------------------------
-# Interface
-# ---------------------------------------------------------------------------
 modele, elos, hist, derniere_date = preparer()
 equipes = sorted(elos)
 
-st.title("⚽ Prédiction de match international")
-st.caption(f"Modèle Elo + forme récente · données à jour au {derniere_date}")
 
-# Valeurs par défaut si présentes dans le dataset
-def index_defaut(nom, secours=0):
+def idx(nom, secours=0):
     return equipes.index(nom) if nom in equipes else secours
 
-col1, col2 = st.columns(2)
-with col1:
-    domicile = st.selectbox("Équipe à domicile", equipes, index=index_defaut("France"))
-with col2:
-    exterieur = st.selectbox("Équipe à l'extérieur", equipes, index=index_defaut("Senegal", 1))
 
-terrain_neutre = st.checkbox(
-    "Terrain neutre (ex : Coupe du monde)",
-    value=True,
-    help="Coché, l'avantage du terrain est neutralisé pour l'équipe à domicile.",
-)
+# ==========================================================================
+# EN-TÊTE + SAISIE
+# ==========================================================================
+st.title("⚽ Oracle des matchs")
+st.caption(f"Probabilités estimées par un modèle Elo + forme récente · "
+           f"≈ 49 000 matchs depuis 1872 · données à jour au {derniere_date}")
+
+c1, c2, c3 = st.columns([5, 5, 4])
+with c1:
+    domicile = st.selectbox("Équipe A (domicile)", equipes, index=idx("France"))
+with c2:
+    exterieur = st.selectbox("Équipe B (extérieur)", equipes, index=idx("Senegal", 1))
+with c3:
+    neutre = st.toggle("Terrain neutre", value=True,
+                       help="Coché (ex. Coupe du monde), l'avantage du terrain est neutralisé.")
 
 if domicile == exterieur:
     st.warning("Choisis deux équipes différentes.")
     st.stop()
 
-# --- Prédiction ---
-p = proba_match(modele, elos, hist, domicile, exterieur, terrain_neutre)
-labels = {"domicile": f"Victoire {domicile}", "nul": "Match nul", "exterieur": f"Victoire {exterieur}"}
+p, f_dom, f_ext = proba_match(modele, elos, hist, domicile, exterieur, neutre)
+labels = {"domicile": f"Victoire {domicile}", "nul": "Match nul",
+          "exterieur": f"Victoire {exterieur}"}
 
+# ==========================================================================
+# BANDEAU "AFFICHE"
+# ==========================================================================
+st.markdown(f"""
+<div class="vs-card">
+  <div style="display:flex; align-items:center; justify-content:space-around;">
+    <div><div class="vs-team">{domicile}</div><div class="vs-elo">Elo {elos[domicile]:.0f}</div></div>
+    <div class="vs-mid">VS</div>
+    <div><div class="vs-team">{exterieur}</div><div class="vs-elo">Elo {elos[exterieur]:.0f}</div></div>
+  </div>
+</div>
+""", unsafe_allow_html=True)
+
+st.write("")
+
+# ==========================================================================
+# PROBABILITÉS : barre 100 % empilée (Plotly)
+# ==========================================================================
 st.subheader("Probabilités")
-c1, c2, c3 = st.columns(3)
-c1.metric(labels["domicile"], f"{p['domicile']:.1%}")
-c2.metric(labels["nul"], f"{p['nul']:.1%}")
-c3.metric(labels["exterieur"], f"{p['exterieur']:.1%}")
+segments = [("domicile", VERT), ("nul", GRIS), ("exterieur", ROUGE)]
+fig = go.Figure()
+for cle, couleur in segments:
+    fig.add_bar(x=[p[cle]*100], y=["match"], orientation="h", name=labels[cle],
+                marker_color=couleur,
+                text=[f"{labels[cle]}<br>{p[cle]*100:.0f}%"], textposition="inside",
+                insidetextanchor="middle", hovertemplate="%{x:.1f}%<extra></extra>")
+fig.update_layout(barmode="stack", height=120, showlegend=False,
+                  margin=dict(l=10, r=10, t=6, b=6),
+                  xaxis=dict(visible=False, range=[0, 100]),
+                  yaxis=dict(visible=False), plot_bgcolor="rgba(0,0,0,0)")
+st.plotly_chart(fig, width="stretch")
 
-# Graphique en barres (ordre logique domicile / nul / extérieur)
-ordre = ["domicile", "nul", "exterieur"]
-chart_df = pd.DataFrame(
-    {"probabilité": [p[k] for k in ordre]},
-    index=[labels[k] for k in ordre],
-)
-st.bar_chart(chart_df)
+# Trois cartes chiffrées
+m1, m2, m3 = st.columns(3)
+m1.metric(labels["domicile"], f"{p['domicile']:.0%}")
+m2.metric(labels["nul"], f"{p['nul']:.0%}")
+m3.metric(labels["exterieur"], f"{p['exterieur']:.0%}")
 
-# Issue la plus probable
+# ==========================================================================
+# FAVORI + CONFIANCE
+# ==========================================================================
 favori = max(p, key=p.get)
-st.success(f"Issue la plus probable : **{labels[favori]}**  ({p[favori]:.1%})")
+proba_fav = p[favori]
+if proba_fav >= 0.65:
+    confiance = "élevée 💪"
+elif proba_fav >= 0.45:
+    confiance = "moyenne 🤔"
+else:
+    confiance = "faible, match indécis 🎲"
 
-# Repères Elo
+st.markdown(f"""
+<div class="fav-box">
+  🔮 Issue la plus probable : <b>{labels[favori]}</b> à <b>{proba_fav:.0%}</b>
+  &nbsp;·&nbsp; confiance {confiance}
+</div>
+""", unsafe_allow_html=True)
+
+# ==========================================================================
+# COMPARAISON DES DEUX ÉQUIPES
+# ==========================================================================
 st.divider()
-e1, e2 = st.columns(2)
-e1.metric(f"Elo {domicile}", f"{elos[domicile]:.0f}")
-e2.metric(f"Elo {exterieur}", f"{elos[exterieur]:.0f}")
+st.subheader("Comparaison des équipes")
+compa = pd.DataFrame({
+    "Indicateur": ["Classement Elo", "Forme récente (pts/match, 5 derniers)"],
+    domicile: [f"{elos[domicile]:.0f}", f"{f_dom:.2f}"],
+    exterieur: [f"{elos[exterieur]:.0f}", f"{f_ext:.2f}"],
+})
+st.dataframe(compa, hide_index=True, width="stretch")
 
-st.caption(
-    "Rappel : ces probabilités reposent sur l'historique des résultats "
-    "(force et forme des équipes), sans tenir compte des compositions, "
-    "blessures ou enjeu du match."
-)
+st.markdown('<p class="note">Rappel : ces probabilités reposent sur la force et la '
+            'forme des équipes (historique des résultats). Elles ne tiennent pas compte '
+            'des compositions, blessures ou enjeu du match. Ce n\'est pas un conseil de pari.</p>',
+            unsafe_allow_html=True)

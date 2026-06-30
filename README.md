@@ -102,6 +102,59 @@ qu'il faut forcer, c'est une conséquence de la distribution des buts.
 Le **score exact** est correct dans **~14 %** des cas et la **différence de buts** dans
 **~25 %** — des niveaux solides pour du football, stables en walk-forward (2020-2025).
 
+## Évaluation probabiliste et calibration
+
+La précision (accuracy) seule ne suffit pas à juger un modèle qui produit des
+probabilités : elle ignore la confiance. Le module `footpredictor.evaluation` ajoute les
+métriques de référence du pronostic sportif :
+
+- **RPS** (Ranked Probability Score) — la métrique standard du 1X2, qui tient
+  compte de l'ordre des issues (se tromper « de peu » coûte moins cher) ;
+- **log-loss** et **Brier** — qui pénalisent une confiance mal placée ;
+- une **table de calibration** : quand le modèle annonce 30 %, l'issue arrive-t-elle
+  vraiment ~30 % du temps ?
+
+Classement par RPS (test ≥ 2022, plus bas = meilleur) :
+
+| Modèle | RPS | Précision |
+| --- | --- | --- |
+| Modèle de score (Poisson) | **0,1716** | 60,1 % |
+| Classifieur `precision` | 0,1724 | 60,0 % |
+| Classifieur `equilibre` **calibré** | 0,1725 | 60,1 % |
+| Classifieur `equilibre` (brut) | 0,1790 | 55,4 % |
+| Baseline (fréquences de base) | 0,2284 | 47,8 % |
+
+Deux enseignements : le **modèle de score est le meilleur prédicteur probabiliste**
+(pas seulement pour les nuls), et la **calibration sigmoïde (Platt) « répare » le mode
+`equilibre`** — ses probabilités brutes étaient trop sûres d'elles (il annonçait 36 % de
+nul là où la réalité était 27 %). Une fois calibré, son RPS rejoint celui du mode
+précision tout en gardant sa lecture équilibrée. L'application affiche désormais des
+**probabilités calibrées**.
+
+## Modèle Dixon-Coles et ensemble
+
+Pour aller plus loin, un second modèle de buts a été ajouté (`footpredictor.dixon_coles`) :
+le modèle **Dixon-Coles**, où chaque équipe a une **force d'attaque et de défense**
+estimées par maximum de vraisemblance (régression de Poisson pondérée par récence,
+demi-vie ≈ 4 ans), plus la correction `rho` ajustée. Ses classements sont crédibles
+(meilleures attaques : Espagne, Brésil, Allemagne ; meilleures défenses : Argentine,
+Angleterre).
+
+Pris seul, Dixon-Coles fait **jeu égal** avec le modèle Elo-Poisson — un modèle plus
+sophistiqué ne bat pas forcément un bon Elo. Mais comme les deux apportent des points de
+vue **différents**, leur **ensemble** (moyenne des matrices de scores) bat chacun pris
+isolément, de façon stable :
+
+| Modèle (test ≥ 2022) | RPS | log-loss | Brier |
+| --- | --- | --- | --- |
+| Modèle Elo-Poisson | 0,1716 | 0,8757 | 0,5148 |
+| Modèle Dixon-Coles | 0,1750 | 0,8868 | 0,5208 |
+| **Ensemble des deux** | **0,1700** | **0,8690** | **0,5104** |
+
+C'est le **meilleur prédicteur du projet**, et c'est lui que l'application utilise désormais
+pour le score. Enseignement : l'**ensemble de modèles diversifiés** est un levier plus
+fiable que la course au modèle unique le plus complexe.
+
 ## Limites et pistes d'amélioration
 
 Avec ces seules données historiques, la prédiction en trois classes **plafonne autour de
@@ -125,39 +178,76 @@ données :
 
 `Python` · `pandas` · `NumPy` · `scikit-learn` · `Streamlit` · `Plotly`
 
+## Données auto-rafraîchies
+
+Le projet est packagé comme une **librairie Python installable** (`footpredictor`). Les
+données ne sont plus saisies à la main : elles sont **téléchargées et mises à jour
+automatiquement** depuis le dépôt public [`martj42/international_results`](https://github.com/martj42/international_results)
+(licence CC0), mises en cache localement, et re-téléchargées seulement quand le cache est
+périmé. Hors-ligne, la librairie bascule sur le cache puis sur un instantané embarqué — elle
+fonctionne donc toujours.
+
 ## Installation et utilisation
 
 ```bash
-# 1. Environnement
 python3 -m venv venv
-source venv/bin/activate        # Windows : .\venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-
-# 2. Données : placer results.csv dans le dossier attendu (cf. CHEMIN_CSV)
-
-# 3a. Analyse en ligne de commande
-python prediction_foot.py        # issue 1X2 (mode equilibre par défaut)
-python prediction_score.py       # score exact le plus probable
-
-# 3b. Ou lancer l'application (choix du mode + score + matrice)
-streamlit run main.py
+source venv/bin/activate          # Windows : .\venv\Scripts\Activate.ps1
+pip install -e ".[app]"           # installe la librairie + dépendances de l'app
 ```
 
-Pour basculer le classifieur en mode précision maximale, mettre `MODE = "precision"`
-dans `prediction_foot.py` (ou utiliser le sélecteur dans l'application).
+### Comme librairie
+
+```python
+from footpredictor import Predictor
+
+p = Predictor()                                   # télécharge les données + entraîne
+res = p.predict("France", "Senegal", neutral=True)
+print(res["score_exact"])                          # ex. (1, 0)
+print(res["proba_issue"])                          # probas 1X2 calibrées
+p.update()                                          # forcer le rafraîchissement des données
+p.chercher_equipe("ivory")                          # retrouver le nom exact d'une équipe
+```
+
+### En ligne de commande
+
+```bash
+footpredictor France Senegal --neutral     # prédiction issue + score
+footpredictor --top-elo 10                 # classement Elo actuel
+footpredictor --search ivory               # chercher une équipe
+footpredictor France Brazil --update       # forcer le rafraîchissement des données
+```
+
+### Application
+
+```bash
+streamlit run app/main.py                  # issue calibrée + score ensemble + heatmap
+```
+
+### Benchmarks
+
+```bash
+python benchmarks/backtest_walkforward.py  # validation glissante 2014-2025
+python benchmarks/compare_models.py        # RPS / log-loss / Brier de tous les modèles
+```
 
 ## Structure du projet
 
 ```
 .
-├── prediction_foot.py        # classifieur 1X2 : features, modes, entraînement, prédiction
-├── prediction_score.py       # modèle de score (double Poisson + Dixon-Coles)
-├── main.py                   # interface Streamlit (issue + score + heatmap)
-├── backtest_walkforward.py   # validation glissante 2014-2025
-├── backtest_full_history.py  # validation glissante depuis 1872 (par décennie)
-├── requirements.txt
-├── archive/
-│   └── results.csv           # jeu de données
+├── src/footpredictor/            # la librairie
+│   ├── data.py                   # téléchargement auto + cache + fallback hors-ligne
+│   ├── features.py               # feature engineering causal (Elo, forme, nuls)
+│   ├── classifier.py             # classifieur 1X2 (modes + calibration)
+│   ├── score.py                  # modèle de score Elo-Poisson + ensemble
+│   ├── dixon_coles.py            # modèle force attaque/défense
+│   ├── evaluation.py             # métriques RPS / log-loss / Brier
+│   ├── predictor.py              # API haut niveau : classe Predictor
+│   ├── cli.py                    # interface ligne de commande
+│   └── data/results.csv          # instantané embarqué (secours hors-ligne)
+├── app/main.py                   # application Streamlit
+├── benchmarks/                   # backtests et comparaison de modèles
+├── tests/                        # tests de fumée (pytest)
+├── pyproject.toml                # packaging installable
 ├── BACKTEST.md
 └── README.md
 ```

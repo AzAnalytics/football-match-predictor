@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "football-match-predictor"
+version = "1.0.0"
+description = "Prédiction de l'issue et du score des matchs internationaux de football (données auto-rafraîchies)."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Alexis Zueras — AZ Analytics" }]
+keywords = ["football", "soccer", "elo", "poisson", "dixon-coles", "prediction"]
+dependencies = [
+    "pandas",
+    "numpy",
+    "scipy",
+    "scikit-learn",
+]
+
+[project.optional-dependencies]
+app = ["streamlit>=1.40", "plotly>=5.18"]
+dev = ["pytest"]
+
+[project.scripts]
+footpredictor = "footpredictor.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/AzAnalytics/football-match-predictor"
+Dataset = "https://github.com/martj42/international_results"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+footpredictor = ["data/results.csv"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

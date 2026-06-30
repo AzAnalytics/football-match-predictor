@@ -5,7 +5,7 @@ Lancement :
     pip install -r requirements.txt
     streamlit run main.py
 
-prediction_foot.py doit être dans le MÊME dossier (l'app y puise ses fonctions).
+prediction_foot.py et prediction_score.py doivent être dans le MÊME dossier.
 """
 import numpy as np
 import pandas as pd
@@ -164,8 +164,6 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 # ==========================================================================
-""" unsafe_allow_html=True)
-
 # SCORE FINAL LE PLUS PROBABLE (double Poisson)
 # ==========================================================================
 st.divider()
@@ -223,6 +221,15 @@ st.markdown('<p class="note">Le score est estimé par deux régressions de Poiss
 # ==========================================================================
 # COMPARAISON DES DEUX ÉQUIPES
 # ==========================================================================
+st.divider()
+st.subheader("Comparaison des équipes")
+compa = pd.DataFrame({
+    "Indicateur": ["Classement Elo", "Forme récente (pts/match, 5 derniers)"],
+    domicile: [f"{elos[domicile]:.0f}", f"{f_dom:.2f}"],
+    exterieur: [f"{elos[exterieur]:.0f}", f"{f_ext:.2f}"],
+})
+st.dataframe(compa, hide_index=True, width="stretch")
+
 st.markdown('<p class="note">Rappel : ces probabilités reposent sur la force et la '
             'forme des équipes (historique des résultats). Elles ne tiennent pas compte '
             'des compositions, blessures ou enjeu du match. Ce n\'est pas un conseil de pari.</p>',

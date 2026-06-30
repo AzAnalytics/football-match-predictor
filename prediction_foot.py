@@ -4,10 +4,20 @@ Données : martj42/international_results (results.csv).
 
 Pipeline :
   1. Chargement + nettoyage + création de la cible
-  2. Calcul des features en UNE passe chronologique (Elo pondéré + forme récente)
+  2. Calcul des features en UNE passe chronologique (Elo pondéré + forme + signaux de nul)
   3. Découpage temporel train/test (on prédit le futur, pas de mélange aléatoire)
-  4. Entraînement de deux modèles + évaluation
+  4. Entraînement selon le MODE choisi + évaluation
   5. Prédiction des probabilités pour n'importe quel match
+
+Deux MODES (cf. config_mode) :
+  - "precision"  : maximise la précision globale (~60 %), mais ne prédit
+                   quasiment jamais les nuls. C'est le modèle d'origine.
+  - "equilibre"  : ajoute des features ciblant les matchs serrés + une
+                   pondération de classe "balanced". La précision globale
+                   baisse (~55 %) mais le modèle prédit RÉELLEMENT les nuls
+                   (recall ~37 % vs 0,7 %) et son macro-F1 est nettement
+                   meilleur (~0,52 vs ~0,44). À privilégier si on veut un
+                   modèle utile sur les 3 classes, pas seulement "domicile".
 """
 
 import numpy as np
@@ -18,7 +28,8 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import make_pipeline
 from sklearn.ensemble import HistGradientBoostingClassifier
-from sklearn.metrics import accuracy_score, classification_report
+from sklearn.metrics import (accuracy_score, classification_report,
+                             recall_score, f1_score)
 
 
 # ---------------------------------------------------------------------------
@@ -29,7 +40,31 @@ DATE_CUTOFF = "2022-01-01"           # avant = entraînement, à partir de = tes
 BASE_ELO = 1500                      # note de départ d'une équipe
 HOME_ADV = 65                        # bonus Elo à domicile (annulé si terrain neutre)
 FENETRE_FORME = 5                    # nb de matchs récents pris en compte pour la forme
-FEATURES = ["elo_diff", "form_diff", "home_elo", "away_elo", "neutral"]
+FENETRE_NUL = 10                     # nb de matchs récents pour le taux de nul d'une équipe
+
+MODE = "equilibre"                   # "precision" ou "equilibre" (défaut conseillé)
+
+# Features communes (modèle d'origine) et features supplémentaires (mode equilibre)
+FEATURES_PRECISION = ["elo_diff", "form_diff", "home_elo", "away_elo", "neutral"]
+FEATURES_EQUILIBRE = FEATURES_PRECISION + [
+    "exp_home",       # probabilité Elo de gagner à domicile (intègre l'avantage terrain)
+    "abs_elo_diff",   # écart de niveau absolu : petit = match serré = nul plus probable
+    "draw_rate_sum",  # propension récente des deux équipes à faire des nuls
+    "rest_diff",      # différence de jours de repos avant le match
+    "min_played",     # nb de matchs joués par la moins expérimentée (maturité de l'Elo)
+]
+# Alias rétro-compatible : pointe sur les features du MODE courant.
+FEATURES = FEATURES_EQUILIBRE if MODE == "equilibre" else FEATURES_PRECISION
+
+
+def config_mode(mode=MODE):
+    """Renvoie (liste de features, modèle non entraîné) correspondant au mode."""
+    if mode == "precision":
+        return FEATURES_PRECISION, HistGradientBoostingClassifier(random_state=0)
+    if mode == "equilibre":
+        return (FEATURES_EQUILIBRE,
+                HistGradientBoostingClassifier(random_state=0, class_weight="balanced"))
+    raise ValueError(f"Mode inconnu : {mode!r} (attendu 'precision' ou 'equilibre')")
 
 
 # ---------------------------------------------------------------------------
@@ -84,96 +119,138 @@ def mult_buts(ecart):
 
 
 # ---------------------------------------------------------------------------
-# 3. Calcul des features en UNE seule passe chronologique
+# 3. Construction des features AVANT un match (source unique de vérité)
 # ---------------------------------------------------------------------------
+def _features_avant_match(home, away, neutral, date, etat):
+    """
+    Calcule toutes les features d'un match à partir de l'état des équipes AVANT
+    le coup d'envoi. Utilisé à la fois pour l'entraînement (passe chronologique)
+    et pour la prédiction d'un nouveau match -> aucune divergence de logique.
+
+    `date=None` (prédiction d'un match hypothétique sans date) neutralise le repos.
+    """
+    elos, hist = etat["elos"], etat["hist"]
+    draw, last, npl = etat["draw"], etat["last_date"], etat["n_played"]
+
+    r_home = elos.get(home, BASE_ELO)
+    r_away = elos.get(away, BASE_ELO)
+    f_home = np.mean(hist[home]) if len(hist[home]) else 1.0
+    f_away = np.mean(hist[away]) if len(hist[away]) else 1.0
+
+    adv = 0 if neutral else HOME_ADV
+    exp_home = 1 / (1 + 10 ** ((r_away - (r_home + adv)) / 400))
+
+    dr_home = np.mean(draw[home]) if len(draw[home]) else 0.25
+    dr_away = np.mean(draw[away]) if len(draw[away]) else 0.25
+
+    if date is not None:
+        rest_h = (date - last[home]).days if home in last else 180
+        rest_a = (date - last[away]).days if away in last else 180
+        rest_diff = np.clip(rest_h, 0, 365) - np.clip(rest_a, 0, 365)
+    else:
+        rest_diff = 0
+
+    return {
+        "elo_diff": r_home - r_away,
+        "form_diff": f_home - f_away,
+        "home_elo": r_home,
+        "away_elo": r_away,
+        "neutral": bool(neutral),
+        "exp_home": exp_home,
+        "abs_elo_diff": abs(r_home - r_away),
+        "draw_rate_sum": dr_home + dr_away,
+        "rest_diff": rest_diff,
+        "min_played": min(npl[home], npl[away]),
+    }
+
+
 def calculer_features(df):
     """
     Parcourt les matchs dans l'ordre du temps. Pour chaque match, on LIT l'état
-    des deux équipes (Elo + forme) AVANT le coup d'envoi -> ce sont les features,
-    donc aucune information du futur ne fuite. On MET À JOUR ensuite.
+    des deux équipes AVANT le coup d'envoi -> ce sont les features, donc aucune
+    information du futur ne fuite. On MET À JOUR ensuite.
 
-    Renvoie le df enrichi, plus l'état final `elos` et `hist` qui serviront
-    à prédire de nouveaux matchs.
+    Renvoie : (df enrichi, elos, hist, etat). `elos` et `hist` restent exposés
+    pour la rétro-compatibilité ; `etat` regroupe tout ce dont la prédiction a
+    besoin (y compris taux de nul, dernière date jouée, nb de matchs joués).
     """
-    elos = {}                                              # note courante de chaque équipe
-    hist = defaultdict(lambda: deque(maxlen=FENETRE_FORME))  # points des N derniers matchs
+    etat = {
+        "elos": {},
+        "hist": defaultdict(lambda: deque(maxlen=FENETRE_FORME)),   # points récents
+        "draw": defaultdict(lambda: deque(maxlen=FENETRE_NUL)),     # 1 si nul, 0 sinon
+        "last_date": {},                                            # dernière date jouée
+        "n_played": defaultdict(int),                               # nb de matchs joués
+    }
+    elos = etat["elos"]
+    hist = etat["hist"]
+    draw = etat["draw"]
 
-    home_elos, away_elos = [], []
-    home_form, away_form = [], []
-
+    lignes = []
     for row in df.itertuples(index=False):
         home, away = row.home_team, row.away_team
 
         # --- (a) LECTURE de l'état d'avant-match = les features ---
-        r_home = elos.get(home, BASE_ELO)
-        r_away = elos.get(away, BASE_ELO)
-        home_elos.append(r_home)
-        away_elos.append(r_away)
-
-        f_home = np.mean(hist[home]) if len(hist[home]) else 1.0  # 1.0 = forme neutre par défaut
-        f_away = np.mean(hist[away]) if len(hist[away]) else 1.0
-        home_form.append(f_home)
-        away_form.append(f_away)
+        feats = _features_avant_match(home, away, row.neutral, row.date, etat)
+        lignes.append(feats)
+        r_home, r_away = feats["home_elo"], feats["away_elo"]
+        exp_home = feats["exp_home"]
 
         # --- (b) Résultat réel du match ---
         if row.home_score > row.away_score:
-            s_home, pts_home, pts_away = 1.0, 3, 0
+            s_home, pts_home, pts_away, est_nul = 1.0, 3, 0, 0
         elif row.home_score == row.away_score:
-            s_home, pts_home, pts_away = 0.5, 1, 1
+            s_home, pts_home, pts_away, est_nul = 0.5, 1, 1, 1
         else:
-            s_home, pts_home, pts_away = 0.0, 0, 3
+            s_home, pts_home, pts_away, est_nul = 0.0, 0, 3, 0
 
         # --- (c) MISE À JOUR de l'Elo (pondérée importance × écart de buts) ---
-        adv = 0 if row.neutral else HOME_ADV
-        exp_home = 1 / (1 + 10 ** ((r_away - (r_home + adv)) / 400))
         k = poids_importance(row.tournament) * mult_buts(row.home_score - row.away_score)
         elos[home] = r_home + k * (s_home - exp_home)
         elos[away] = r_away + k * ((1 - s_home) - (1 - exp_home))
 
-        # --- (d) MISE À JOUR de la forme ---
-        hist[home].append(pts_home)
-        hist[away].append(pts_away)
+        # --- (d) MISE À JOUR de la forme, des nuls, du repos, du compteur ---
+        hist[home].append(pts_home); hist[away].append(pts_away)
+        draw[home].append(est_nul); draw[away].append(est_nul)
+        etat["last_date"][home] = row.date; etat["last_date"][away] = row.date
+        etat["n_played"][home] += 1; etat["n_played"][away] += 1
 
-    df["home_elo"] = home_elos
-    df["away_elo"] = away_elos
-    df["elo_diff"] = df["home_elo"] - df["away_elo"]
-    df["home_form"] = home_form
-    df["away_form"] = away_form
-    df["form_diff"] = df["home_form"] - df["away_form"]
-
-    return df, elos, hist
+    feat_df = pd.DataFrame(lignes, index=df.index)
+    # "neutral" existe déjà dans df : on évite de le dupliquer au concat.
+    feat_df = feat_df.drop(columns=[c for c in feat_df.columns if c in df.columns])
+    df = pd.concat([df, feat_df], axis=1)
+    return df, elos, hist, etat
 
 
 # ---------------------------------------------------------------------------
 # 4. Entraînement et évaluation
 # ---------------------------------------------------------------------------
-def entrainer(df, rapport=True):
-    """Entraîne deux modèles sur le passé, évalue sur le futur, renvoie le meilleur."""
+def entrainer(df, mode=MODE, rapport=True):
+    """Entraîne le modèle du mode choisi sur le passé, évalue sur le futur."""
+    feats, modele = config_mode(mode)
     train = df[df["date"] < DATE_CUTOFF]
     test = df[df["date"] >= DATE_CUTOFF]
 
-    X_train, y_train = train[FEATURES], train["resultat"]
-    X_test, y_test = test[FEATURES], test["resultat"]
+    X_train, y_train = train[feats], train["resultat"]
+    X_test, y_test = test[feats], test["resultat"]
 
     baseline = (y_test == "domicile").mean()
-    print(f"Baseline (toujours domicile) : {baseline:.4f}")
+    pred = modele.fit(X_train, y_train).predict(X_test)
 
-    # Modèle simple et interprétable
-    logit = make_pipeline(StandardScaler(), LogisticRegression(max_iter=1000))
-    logit.fit(X_train, y_train)
-    print(f"Régression logistique        : {accuracy_score(y_test, logit.predict(X_test)):.4f}")
+    acc = accuracy_score(y_test, pred)
+    rec_nul = recall_score(y_test, pred, labels=["nul"], average="macro", zero_division=0)
+    f1m = f1_score(y_test, pred, average="macro", zero_division=0)
 
-    # Modèle non-linéaire (souvent un poil meilleur sur tableau de données)
-    gb = HistGradientBoostingClassifier(random_state=0)
-    gb.fit(X_train, y_train)
-    pred = gb.predict(X_test)
-    print(f"Gradient boosting            : {accuracy_score(y_test, pred):.4f}")
+    print(f"Mode                          : {mode}")
+    print(f"Baseline (toujours domicile)  : {baseline:.4f}")
+    print(f"Précision globale             : {acc:.4f}")
+    print(f"Recall sur les nuls           : {rec_nul:.4f}")
+    print(f"Macro-F1 (équilibre 3 classes): {f1m:.4f}")
 
     if rapport:
-        print("\nDétail par classe (gradient boosting) :")
+        print("\nDétail par classe :")
         print(classification_report(y_test, pred, digits=3))
 
-    return gb
+    return modele
 
 
 # ---------------------------------------------------------------------------
@@ -184,30 +261,26 @@ def chercher_equipe(motif, elos):
     return [t for t in sorted(elos) if motif.lower() in t.lower()]
 
 
-def predire(modele, elos, hist, equipe_dom, equipe_ext, terrain_neutre=False):
+def proba_match(modele, etat, equipe_dom, equipe_ext, terrain_neutre=False, mode=MODE):
+    """Renvoie un dict {classe: proba} pour le match choisi (utilisé par l'app)."""
+    feats = config_mode(mode)[0]
+    ligne = _features_avant_match(equipe_dom, equipe_ext, terrain_neutre, None, etat)
+    X = pd.DataFrame([ligne])[feats]
+    proba = modele.predict_proba(X)[0]
+    return dict(zip(modele.classes_, proba))
+
+
+def predire(modele, etat, equipe_dom, equipe_ext, terrain_neutre=False, mode=MODE):
     """Affiche les probabilités domicile / nul / extérieur pour le match choisi."""
     for t in (equipe_dom, equipe_ext):
-        if t not in elos:
+        if t not in etat["elos"]:
             print(f"⚠️  '{t}' introuvable. Essaie chercher_equipe('...', elos).")
             return
 
-    r_dom, r_ext = elos[equipe_dom], elos[equipe_ext]
-    f_dom = np.mean(hist[equipe_dom]) if len(hist[equipe_dom]) else 1.0
-    f_ext = np.mean(hist[equipe_ext]) if len(hist[equipe_ext]) else 1.0
-
-    # On reconstruit EXACTEMENT la même ligne de features qu'à l'entraînement
-    X = pd.DataFrame([{
-        "elo_diff": r_dom - r_ext,
-        "form_diff": f_dom - f_ext,
-        "home_elo": r_dom,
-        "away_elo": r_ext,
-        "neutral": terrain_neutre,
-    }])[FEATURES]
-
-    proba = modele.predict_proba(X)[0]
+    p = proba_match(modele, etat, equipe_dom, equipe_ext, terrain_neutre, mode)
     print(f"\n{equipe_dom} vs {equipe_ext}  (terrain neutre = {terrain_neutre})")
-    for classe, p in sorted(zip(modele.classes_, proba), key=lambda x: -x[1]):
-        print(f"  {classe:<10}: {p:6.1%}")
+    for classe, proba in sorted(p.items(), key=lambda x: -x[1]):
+        print(f"  {classe:<10}: {proba:6.1%}")
 
 
 # ---------------------------------------------------------------------------
@@ -218,14 +291,14 @@ if __name__ == "__main__":
     print(f"{df.shape[0]} matchs chargés "
           f"({df['date'].min().date()} -> {df['date'].max().date()})\n")
 
-    df, elos, hist = calculer_features(df)
+    df, elos, hist, etat = calculer_features(df)
 
     print("Top 5 Elo actuel :")
     for team, rating in sorted(elos.items(), key=lambda x: -x[1])[:5]:
         print(f"  {team:<15} {rating:.0f}")
     print()
 
-    modele = entrainer(df)
+    modele = entrainer(df, mode=MODE)
 
     # Change librement les équipes ici (noms anglais, cf. chercher_equipe)
-    predire(modele, elos, hist, "France", "Senegal", terrain_neutre=True)
+    predire(modele, etat, "France", "Senegal", terrain_neutre=True, mode=MODE)

@@ -19,6 +19,19 @@ from .features import (FEATURES_PRECISION, FEATURES_EQUILIBRE, features_avant_ma
 DATE_CUTOFF = "2022-01-01"   # avant = entraînement, à partir de = test/calibration
 
 
+def calibrer(base, X, y, method="sigmoid"):
+    """
+    Calibre un modèle DÉJÀ entraîné, en restant compatible avec toutes les versions
+    de scikit-learn : `FrozenEstimator` (sklearn >= 1.6) ou `cv='prefit'` (plus anciennes,
+    où FrozenEstimator n'existe pas). sklearn >= 1.8 a supprimé `cv='prefit'`.
+    """
+    try:
+        from sklearn.frozen import FrozenEstimator
+        return CalibratedClassifierCV(FrozenEstimator(base), method=method).fit(X, y)
+    except ImportError:
+        return CalibratedClassifierCV(base, method=method, cv="prefit").fit(X, y)
+
+
 def config_mode(mode="equilibre"):
     """Renvoie (features, modèle non entraîné) pour le mode demandé."""
     if mode == "precision":
@@ -53,8 +66,7 @@ def entrainer_calibre(df, mode="equilibre", cutoff=DATE_CUTOFF, method="sigmoid"
     feats, base = config_mode(mode)
     base.fit(df[df["date"] < cutoff][feats], df[df["date"] < cutoff]["resultat"])
     recent = df[df["date"] >= cutoff]
-    return CalibratedClassifierCV(base, method=method, cv="prefit").fit(
-        recent[feats], recent["resultat"])
+    return calibrer(base, recent[feats], recent["resultat"], method=method)
 
 
 def proba_match(modele, etat, equipe_dom, equipe_ext, terrain_neutre=False, mode="equilibre"):

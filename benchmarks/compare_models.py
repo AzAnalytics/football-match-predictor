@@ -6,9 +6,9 @@ test >= 2022.
     python benchmarks/compare_models.py
 """
 import numpy as np
-from sklearn.calibration import CalibratedClassifierCV
 
 from footpredictor import load_results, calculer_features, config_mode
+from footpredictor.classifier import calibrer
 from footpredictor.classifier import DATE_CUTOFF
 from footpredictor.score import entrainer_score, matrice_scores, MAXG
 from footpredictor.dixon_coles import DixonColes
@@ -44,7 +44,7 @@ def main():
         _, base = config_mode(mode)
         base.fit(tr[feats], tr["resultat"])
         ligne(f"Classifieur {mode} (brut)", proba_ordonnee(base.predict_proba(te[feats]), base.classes_))
-        cc = CalibratedClassifierCV(base, method="sigmoid", cv="prefit").fit(cal[feats], cal["resultat"])
+        cc = calibrer(base, cal[feats], cal["resultat"], method="sigmoid")
         ligne(f"Classifieur {mode} (calibré)", proba_ordonnee(cc.predict_proba(te[feats]), cc.classes_))
 
     mh, ma = entrainer_score(tr, sur_tout=True)
